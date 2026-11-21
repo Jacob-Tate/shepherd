@@ -37,7 +37,14 @@ See the example [docker-compose.yml](docker-compose.yml) and some more compose c
 
 Shepherd will try to update your services every 5 minutes by default. You can adjust this value using the `SLEEP_TIME` variable.
 
-You can prevent services from being updated by appending them to the `IGNORELIST_SERVICES` variable. This should be a space-separated list of service names.
+You can prevent services from being updated by appending them to the `IGNORELIST_SERVICES` variable. This should be a space-separated list of service names. Entries of the form `label=key=value` (or `label=key`) exclude every service carrying that label, e.g. `IGNORELIST_SERVICES="label=shepherd.autodeploy=false"`.
+
+Set `SKIP_NOT_RUNNING=true` to skip services that have no running tasks (scaled to 0, finished cron jobs).
+
+To avoid registry rate limits:
+- `SERVICE_DELAY` (e.g. `10s`) sleeps between services.
+- `MANIFEST_RETRIES` (default `3`) and `MANIFEST_BACKOFF` (default `30`, seconds, multiplied by the attempt number) retry manifest checks that fail with `toomanyrequests`.
+- Each image is only checked once per run, even when several services use it.
 
 Alternatively you can specify a filter for the services you want updated using the `FILTER_SERVICES` variable. This can be anything accepted by the filtering flag in `docker service ls`.
 

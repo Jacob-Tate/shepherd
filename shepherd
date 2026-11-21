@@ -25,6 +25,67 @@ in_list() {
   echo "false"
 }
 
+# true if the service matches an ignorelist entry: either its name, or a
+# "label=key=value" / "label=key" entry matching the service's labels
+is_ignored() {
+  local list="$1"
+  local name="$2"
+  local item key value actual
+
+  for item in $list; do
+    if [[ "$item" == label=* ]]; then
+      item="${item#label=}"
+      key="${item%%=*}"
+      actual=$(docker service inspect "$name" -f "{{index .Spec.Labels \"$key\"}}")
+      if [[ "$item" == *=* ]]; then
+        value="${item#*=}"
+        [[ "$actual" == "$value" ]] && return 0
+      else
+        [[ -n "$actual" ]] && return 0
+      fi
+    elif [[ "$item" == "$name" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# number of running tasks for a service (the X in "X/Y" from docker service ls)
+running_tasks() {
+  docker service ls --filter "name=$1" --format '{{.Name}} {{.Replicas}}' \
+    | awk -v n="$1" '$1==n {split($2, r, "/"); print r[1]; exit}'
+}
+
+# docker manifest inspect with per-run caching and retry/backoff on rate limits
+declare -A manifest_cache=()
+check_manifest() {
+  local image="$1"
+  shift
+  local cache_key="$*|$image"
+  local attempt=0 retries="${MANIFEST_RETRIES:-3}" backoff="${MANIFEST_BACKOFF:-30}" output
+
+  if [[ -n "${manifest_cache[$cache_key]+x}" ]]; then
+    [[ "${manifest_cache[$cache_key]}" == "ok" ]]
+    return
+  fi
+
+  while true; do
+    if output=$(DOCKER_CLI_EXPERIMENTAL=enabled docker "$@" manifest inspect $insecure_registry_flag "$image" 2>&1 >/dev/null); then
+      manifest_cache[$cache_key]="ok"
+      return 0
+    fi
+    if [[ "$output" == *toomanyrequests* ]] && (( attempt < retries )); then
+      attempt=$((attempt + 1))
+      logger "Rate limited checking $image, retry $attempt/$retries in $((backoff * attempt))s"
+      sleep $((backoff * attempt))
+      continue
+    fi
+    echo "$output" >&2
+    manifest_cache[$cache_key]="fail"
+    return 1
+  done
+}
+
 authenticate_to_registries() {
   local config host user password
   if [[ -n "$registry_user" ]]; then
@@ -83,9 +144,24 @@ update_services() {
   # iterate over all services
   for name in $(IFS=$'\n' docker service ls --quiet --filter "${FILTER_SERVICES}" --format '{{.Name}}'); do
 
-    # skip ignored services
-    if [[ "$(in_list "$ignorelist" "$name")" != "false" ]]; then
+    # skip ignored services (by name or label=key=value)
+    if is_ignored "$ignorelist" "$name"; then
+      logger "Skipping ignored service $name" "${VERBOSE:-true}"
       continue # continue with next service
+    fi
+
+    local running
+    running="$(running_tasks "$name")"
+
+    # skip services with no running tasks (scaled to 0, finished cron jobs, ...)
+    if [[ "${SKIP_NOT_RUNNING:-false}" == "true" ]] && [[ "${running:-0}" == "0" ]]; then
+      logger "Skipping service $name, no running tasks"
+      continue
+    fi
+
+    # space out registry requests to avoid tripping rate limits
+    if [[ -n "${SERVICE_DELAY:-}" ]] && [[ "${SERVICE_DELAY}" != "0" ]]; then
+      sleep "$SERVICE_DELAY"
     fi
 
     local image_with_digest image auth_config config_flag
@@ -99,7 +175,7 @@ update_services() {
       config_flag=(--config "$auth_config")
     fi
 
-    if ! DOCKER_CLI_EXPERIMENTAL=enabled docker "${config_flag[@]}" manifest inspect $insecure_registry_flag "$image" > /dev/null; then
+    if ! check_manifest "$image" "${config_flag[@]}"; then
       logger "Error updating service $name! Image $image does not exist or it is not available"
 
       title="[Shepherd] Error updating service $name"
@@ -109,18 +185,20 @@ update_services() {
     else
       logger "Trying to update service $name with image $image" "true"
 
-      num_tasks=$(docker service ls -f "name=$name" | awk 'NR==2{print $4}')
-      if [[ $num_tasks = 0/* ]]; then
-        detach_option="--detach=true"
+      # services with no running tasks can't converge, so don't wait on them.
+      # Use a per-service variable so this doesn't leak into later services.
+      local svc_detach_option="$detach_option"
+      if [[ "${running:-0}" == "0" ]]; then
+        svc_detach_option="--detach=true"
       fi
 
       # shellcheck disable=SC2086
-      if ! timeout "${TIMEOUT:-300}" docker "${config_flag[@]}" service update "$name" $detach_option $registry_auth $no_resolve_image_flag ${UPDATE_OPTIONS} --image="$image" > /dev/null; then
+      if ! timeout "${TIMEOUT:-300}" docker "${config_flag[@]}" service update "$name" $svc_detach_option $registry_auth $no_resolve_image_flag ${UPDATE_OPTIONS} --image="$image" > /dev/null; then
         logger "Service $name update failed on $hostname!"
         if [[ "${ROLLBACK_ON_FAILURE+x}" ]]; then
           logger "Rolling $name back"
           # shellcheck disable=SC2086
-          docker "${config_flag[@]}" service update "$name" $detach_option ${ROLLBACK_OPTIONS} --rollback > /dev/null
+          docker "${config_flag[@]}" service update "$name" $svc_detach_option ${ROLLBACK_OPTIONS} --rollback > /dev/null
         fi
 
         title="[Shepherd] Service $name update failed on $hostname"
